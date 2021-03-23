@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+
+import argparse
+import os, sys, re
+import typing
+import math
+import binascii
+
+VERSION = 1
+
+DEFAULT_DEVICE_ID   = 0x40200001
+DEFAULT_BIN_ADDRESS = 0x80000000
+DEFAULT_BIN_TYPE    = 0x0
+DEFAULT_ERASE_OPT   = -1
+DEFAULT_PROGRAM_OPT = -1
+DEFAULT_RUN_OPT     = -1
+
+DEFAULT_BYTE = b'\xff'
+
+RUN_OPT_JUMP  = (1 << 0)
+RUN_OPT_RESET = (1 << 1)
+RUN_OPT_STOP  = (1 << 2)
+RUN_OPT_WAIT  = (1 << 3)
+
+OPTION_BYTE_BASE = 0x81000000
+OPTION_BYTE_SIZE = 128
+SRAM_BASE        = 0x20000000
+
+class FlashBank:
+  def __init__(self, device_id, address_range):
+    self.device_id     = device_id
+    self.address_range = address_range
+
+FLASH_BANKS = []
+
+def build_flash(flash_size):
+  global FLASH_BANKS
+  FLASH_BANKS = [
+    FlashBank(0x40200001, [(0x80000000, 0x80000000 + (flash_size or 0x1000000)), (OPTION_BYTE_BASE, OPTION_BYTE_BASE + OPTION_BYTE_SIZE)])
+    ]
+
+def is_flash(device_id, address):
+  for bank in FLASH_BANKS:
+    if bank.device_id == device_id:
+      for range in bank.address_range:
+        if address >= range[0] and address < range[1]:
+          return 1
+  return 0
+
+def is_ram(device_id, address):
+  if is_flash(device_id, address) != 0:
+    return 0
+  else:
+    return 1
+
+def auto_int(x):
+  return int(x, 0)
+
+def auto_file_or_int(input):
+  try:
+    auto_int(input)
+    return input
+  except:
+    return argparse.FileType('rb')(input)
+
+parser = argparse.ArgumentParser(description='Generate offline download binary')
+
+outgrp = parser.add_mutually_exclusive_group(required=True)
+outgrp.add_argument('-o', '--output-file',     help='Output file name',   type=argparse.FileType('wb'))
+outgrp.add_argument('-O', '--output-append',   help='Output append file', type=argparse.FileType('ab'))
+outgrp.add_argument('-I', '--info',            help='Dump header info',   action='store_true')
+parser.add_argument('-i', '--input-file',      help='Input file or data', type=auto_file_or_int, default=[], nargs='+')
+
+parser.add_argument('-d', '--device-id',       help='device ID',       type=auto_int, default=DEFAULT_DEVICE_ID)
+parser.add_argument('-a', '--bin-address',     help='binary address',  type=auto_int, default=[DEFAULT_BIN_ADDRESS], nargs='+')
+parser.add_argument('-t', '--bin-type',        help='binary type',     type=auto_int, default=[DEFAULT_BIN_TYPE],    nargs='+')
+parser.add_argument('-e', '--erase-options',   help='erase options',   type=auto_int, default=[DEFAULT_ERASE_OPT],   nargs='+')
+parser.add_argument('-p', '--program-options', help='program options', type=auto_int, default=[DEFAULT_PROGRAM_OPT], nargs='+')
+parser.add_argument('-r', '--run-options',     help='run options',     type=auto_int, default=[DEFAULT_RUN_OPT],     nargs='+')
+
+parser.add_argument('--flash-size',    help='Total flash size',              type=auto_int)
+parser.add_argument('--allow-overlap', help='Allow overlap of bin sections', action='store_true')
+
+# Options to generate option bytes
+parser.add_argument('--user',           help='User field in option byte',        type=auto_int)
+parser.add_argument('--data0',          help='Data0 field in option byte',       type=auto_int)
+parser.add_argument('--data1',          help='Data1 field in option byte',       type=auto_int)
+parser.add_argument('--misc',           help='Miscellaneous configurations',     type=auto_int)
+parser.add_argument('--osc',            help='Internal oscillator configuration',type=auto_int)
+parser.add_argument('--logic-address',  help='Logic configuration address',      type=auto_int)
+parser.add_argument('--logic-compress', help='Logic configuration compression',  action='store_true')
+parser.add_argument('--logic-encrypt',  help='Logic configuration encryption',   action='store_true')
+parser.add_argument('--logic-config',   help='Logic configuration file',         type=argparse.FileType('rb'))
+parser.add_argument('--xmem',           help='Executable memory in option byte', type=auto_int, nargs='+')
+parser.add_argument('--protect',        help='Protect flash sectors',            type=auto_int)
+parser.add_argument('--lock',           help='Lock flash at the end',            action='store_true')
+
+def to_bytes(value, length):
+  return value.to_bytes(length, 'little');
+
+def from_bytes(bytes):
+  return int.from_bytes(bytes, 'little')
+
+class DownloadHeader:
+  HEADER_SIZE = 256
+  def __init__(self, device_id, bin_size, bin_address, bin_type, erase_options, program_options, run_options, encrypt_offset=0, encrypt_size=0, reserved = None, version=VERSION, checksum=None):
+      self.device_id       = device_id       
+      self.bin_size        = bin_size        
+      self.bin_address     = bin_address     
+      self.bin_type        = bin_type        
+      self.erase_options   = erase_options   
+      self.program_options = program_options 
+      self.run_options     = run_options     
+      self.encrypt_offset  = encrypt_offset     
+      self.encrypt_size    = encrypt_size     
+      self.reserved        = reserved or DEFAULT_BYTE * (DownloadHeader.HEADER_SIZE - (9+2)*4)
+      self.version         = version
+      self.checksum        = checksum
+
+  def from_bytes(header: list[bytes]):
+    return DownloadHeader(
+        device_id       = from_bytes(header[0:4]),
+        bin_size        = from_bytes(header[4:8]),
+        bin_address     = from_bytes(header[8:12]),
+        bin_type        = from_bytes(header[12:16]),
+        erase_options   = from_bytes(header[16:20]),
+        program_options = from_bytes(header[20:24]),
+        run_options     = from_bytes(header[24:28]),
+        encrypt_offset  = from_bytes(header[28:32]),
+        encrypt_size    = from_bytes(header[32:36]),
+        reserved        = header[36:DownloadHeader.HEADER_SIZE-8],
+        version         = from_bytes(header[DownloadHeader.HEADER_SIZE-8:DownloadHeader.HEADER_SIZE-4]),
+        checksum        = from_bytes(header[DownloadHeader.HEADER_SIZE-4:DownloadHeader.HEADER_SIZE]))
+
+  def to_bytes(self):
+    header = bytes()
+    header += to_bytes(self.device_id,       4)
+    header += to_bytes(self.bin_size,        4)
+    header += to_bytes(self.bin_address,     4)
+    header += to_bytes(self.bin_type,        4)
+    header += to_bytes(self.erase_options,   4)
+    header += to_bytes(self.program_options, 4)
+    header += to_bytes(self.run_options,     4)
+    header += to_bytes(self.encrypt_offset,  4)
+    header += to_bytes(self.encrypt_size,    4)
+    header += self.reserved
+    header += to_bytes(self.version,         4)
+    header += to_bytes(binascii.crc32(header), 4)
+    return header
+
+  def get_checksum(self):
+    header = self.to_bytes()
+    return binascii.crc32(header[:-4])
+
+  def is_valid(self):
+    return self.get_checksum() == self.checksum
+
+def has_post_config(args):
+  return args.lock or args.protect
+
+def get_bin_address(args, idx):
+  return args.bin_address[idx if idx != None and idx < len(args.bin_address) else -1]
+
+def get_bin_type(args, idx):
+  return args.bin_type[idx if idx != None and idx < len(args.bin_type) else -1]
+
+def get_erase_options(args, idx, opt_header: DownloadHeader):
+  erase_options = args.erase_options[idx if idx != None and idx < len(args.erase_options) else -1]
+  if erase_options < 0:
+    # No erase is needed with opt_header, since it always includes read unlock, and auto full chip erase
+    erase_options = 0 if opt_header else is_flash(args.device_id, get_bin_address(args, idx))
+  return erase_options
+
+def get_program_options(args, idx):
+  program_options = args.program_options[idx if idx != None and idx < len(args.program_options) else -1]
+  if program_options < 0:
+    program_options = is_flash(args.device_id, get_bin_address(args, idx))
+  return program_options
+
+def get_run_options(args, idx):
+  run_options = args.run_options[idx if idx != None and idx < len(args.run_options) else -1]
+  if run_options < 0:
+    timeout = (-run_options)
+    run_options = timeout << 16
+    if is_ram(args.device_id, get_bin_address(args, idx)):
+      run_options |= RUN_OPT_JUMP
+    if idx == len(args.input_file) - 1 and not has_post_config(args):
+      run_options |= RUN_OPT_STOP
+      run_options |= RUN_OPT_RESET
+  return run_options
+
+def get_run_options_str(run_options):
+  opt_str = [f"0x{run_options:x}"]
+  (run_options & RUN_OPT_JUMP)  and opt_str.append("jump")
+  (run_options & RUN_OPT_RESET) and opt_str.append("reset")
+  (run_options & RUN_OPT_STOP)  and opt_str.append("stop")
+  (run_options & RUN_OPT_WAIT)  and opt_str.append("wait")
+  opt_str.append(f"timeout: {run_options >> 16}")
+  return ', '.join(opt_str)
+
+def dump_header(header: DownloadHeader):
+  print(f"  Version:         {header.version}")
+  print(f"  Device ID:       0x{header.device_id:x}")
+  print(f"  Binary Size:     {header.bin_size}")
+  print(f"  Binary Address:  0x{header.bin_address:x}")
+  print(f"  Binary Type:     0x{header.bin_type:x}")
+  print(f"  Erase Options:   0x{header.erase_options:x}")
+  print(f"  Program Options: 0x{header.program_options:x}")
+  print(f"  Run Options:     {get_run_options_str(header.run_options)}")
+  print(f"  Encrypt Offset:  0x{header.encrypt_offset:x}")
+  print(f"  Encrypt Size:    {header.encrypt_size}")
+  print(f"  Header Checksum: 0x{header.checksum:x}")
+
+inc_path = os.path.dirname(os.path.realpath(__file__))
+inc_file = os.path.join(inc_path, "agrv_fpga_decomp.inc")
+with open(inc_file, 'r', encoding='UTF-8') as inc_fp:
+  byte_ints = []
+  for line in inc_fp:
+    line = line.strip()
+    if line.startswith("/*"):
+        continue
+    for word in [x for x in re.split("[ ,]+", line) if x]:
+        byte_ints.append(auto_int(word))
+LOGIC_ALGO_BIN = bytes(byte_ints)
+LOGIC_ALGO_SIZE = (len(LOGIC_ALGO_BIN) + 8 + 255) & ~255
+
+def get_opt_half(value):
+  return (to_bytes(value, 1) + to_bytes(0xff - value, 1)) if value != None else DEFAULT_BYTE * 2
+
+def get_opt_dword(value):
+  return (to_bytes(value, 4) + to_bytes(0xffffffff - value, 4)) if value != None else DEFAULT_BYTE * 8
+
+def gen_option_bytes(args):
+  option_bytes = bytes()
+  header = None
+
+  if args.user or args.data0 or args.data1 or args.misc or args.osc or args.logic_address:
+    header = DownloadHeader(
+        device_id       = args.device_id,
+        bin_size        = OPTION_BYTE_SIZE,
+        bin_address     = OPTION_BYTE_BASE,
+        bin_type        = get_bin_type(args, None),
+        erase_options   = get_erase_options(args, None, None),
+        program_options = get_program_options(args, None),
+        run_options     = get_run_options(args, None))
+    option_bytes += header.to_bytes()
+    option_bytes += get_opt_half(0xa5)
+    option_bytes += get_opt_half(args.user)
+    option_bytes += get_opt_half(args.data0)
+    option_bytes += get_opt_half(args.data1)
+    option_bytes += DEFAULT_BYTE * 24
+    option_bytes += get_opt_half(args.misc)
+    option_bytes += get_opt_half(args.osc)
+    option_bytes += DEFAULT_BYTE * 12
+    if args.logic_encrypt:
+      option_bytes += (b'\x00' * 8)
+    else:
+      option_bytes += get_opt_dword(None if args.logic_compress else args.logic_address)
+    option_bytes += get_opt_dword((args.logic_address+LOGIC_ALGO_SIZE) if args.logic_compress else None)
+    if args.xmem:
+      for xmem in args.xmem:
+        option_bytes += to_bytes(xmem, 4)
+    if args.logic_compress:
+      option_bytes += get_opt_dword(args.logic_address)
+    option_bytes += DEFAULT_BYTE * (header.bin_size + DownloadHeader.HEADER_SIZE - len(option_bytes))
+  return option_bytes, header
+
+def gen_logic_config(args, opt_header):
+  logic_config = bytes()
+  if args.logic_config and args.logic_address:
+    header = DownloadHeader(
+        device_id       = args.device_id,
+        bin_size        = os.path.getsize(args.logic_config.name) + (LOGIC_ALGO_SIZE if args.logic_compress else 0),
+        bin_address     = args.logic_address,
+        bin_type        = get_bin_type(args, None),
+        erase_options   = get_erase_options(args, None, opt_header),
+        program_options = get_program_options(args, None),
+        run_options     = get_run_options(args, None),
+        # The first 2 words are not compressed, hence will not be encrypted neither
+        encrypt_offset  = ((LOGIC_ALGO_SIZE+8) if args.logic_encrypt else 0),
+        encrypt_size    = ((os.path.getsize(args.logic_config.name)-8) if args.logic_encrypt else 0),
+        version         = VERSION)
+    logic_config += header.to_bytes()
+    if args.logic_compress:
+      logic_config += to_bytes(SRAM_BASE | 0x2, 4)
+      logic_config += to_bytes(len(LOGIC_ALGO_BIN), 4)
+      logic_config += LOGIC_ALGO_BIN
+      logic_config += DEFAULT_BYTE * (LOGIC_ALGO_SIZE - len(LOGIC_ALGO_BIN) - 8)
+    logic_config += args.logic_config.read()
+  return logic_config
+
+def gen_post_config(args):
+  post_config = bytes()
+  if args.protect:
+    header = DownloadHeader(
+        device_id       = args.device_id,
+        bin_size        = 8,
+        bin_address     = OPTION_BYTE_BASE + 8,
+        bin_type        = get_bin_type(args, None),
+        erase_options   = 0, # Do not erase
+        program_options = get_program_options(args, None),
+        run_options     = (0 if args.lock else RUN_OPT_STOP | RUN_OPT_RESET))
+    post_config += header.to_bytes()
+    for i in range(0, 4):
+      post_config += get_opt_half((args.protect >> i * 8) & 0xff)
+  if args.lock:
+    header = DownloadHeader(
+        device_id       = args.device_id,
+        bin_size        = 2,
+        bin_address     = OPTION_BYTE_BASE,
+        bin_type        = get_bin_type(args, None),
+        erase_options   = 0, # Do not erase
+        program_options = get_program_options(args, None),
+        run_options     = RUN_OPT_STOP | RUN_OPT_RESET)
+    post_config += header.to_bytes()
+    post_config += b'\x00\x00'
+  return post_config
+
+def write_output(args):
+  if args.info:
+    input_file: typing.BinaryIO = args.input_file[0]
+    print(f"Input download file: {input_file.name}")
+    download_bin = input_file.read()
+  else:
+    if args.logic_config:
+      logic_size = os.path.getsize(args.logic_config.name)
+      logic_compress = (logic_size < (0xa000-LOGIC_ALGO_SIZE))
+      print(f"Logic: {args.logic_config.name}, {logic_size} bytes")
+      if args.logic_compress and not logic_compress:
+        print("Not a compressed logic config!")
+        return -1
+      elif not args.logic_compress and logic_compress:
+        print("A compressed logic config!")
+        return -1
+      if args.logic_encrypt and not logic_compress:
+        print("Logic encryption only apply to a compressed logic config!")
+        return -1
+    output_file : typing.BinaryIO = args.output_file or args.output_append
+    download_bin, opt_header = gen_option_bytes(args)
+    download_bin += gen_logic_config(args, opt_header)
+    for idx in range(len(args.input_file) if args.input_file else 0):
+      input_file = args.input_file[idx]
+      if isinstance(input_file, str):
+        try:
+          input_data = auto_int(input_file)
+        except:
+          print(f"Error input: {input_file}")
+          return -1
+        # Infer data width
+        if input_file[:2].lower() == '0x':
+          bin_size = (len(input_file) - 2) * 4
+        elif input_file[:2].lower() == '0o':
+          bin_size = (len(input_file) - 2) * 3
+        elif input_file[:2].lower() == '0b':
+          bin_size = (len(input_file) - 2) * 1
+        else:
+          bin_size = math.ceil(math.log2(input_data + 1));
+        bin_size = (bin_size + 31) >> 5 << 2 # Align to word
+        input_bytes = to_bytes(input_data, bin_size)
+        print(f"Input: 0x{input_data:0{bin_size*2}x}, {bin_size} bytes")
+      else:
+        bin_size = os.path.getsize(input_file.name)
+        input_bytes = input_file.read()
+        print(f"Input: {input_file.name}, {bin_size} bytes")
+
+      bin_address     = get_bin_address(args, idx)
+      bin_type        = get_bin_type(args, idx)
+      erase_options   = get_erase_options(args, idx, opt_header)
+      program_options = get_program_options(args, idx)
+      run_options     = get_run_options(args, idx)
+
+      header = DownloadHeader(args.device_id, bin_size, bin_address, bin_type, erase_options, program_options, run_options)
+      download_bin += header.to_bytes()
+      download_bin += input_bytes
+    download_bin += gen_post_config(args)
+    output_file.write(download_bin)
+    output_file.close()
+    print(f"Output: {output_file.name}, {os.path.getsize(output_file.name)} bytes")
+
+  # Dump headers
+  i = 0
+  all_headers = []
+  while i < len(download_bin):
+    header = DownloadHeader.from_bytes(download_bin[i:])
+    dump_header(header);
+    if (not header.is_valid()):
+      print("Error in header!")
+      return -1
+    # Check for overlap between sections
+    if is_flash(header.device_id, header.bin_address) and not is_flash(header.device_id, header.bin_address + header.bin_size - 1):
+      print(f"Error: section exceeds flash range at 0x{header.bin_address + header.bin_size - 1:x}")
+      return -1
+    if not args.allow_overlap:
+      for (start, end) in [(h.bin_address, h.bin_address + h.bin_size) for h in all_headers]:
+        if header.bin_address < end and header.bin_address + header.bin_size > start:
+          # Allow overwriting option bytes
+          if start != OPTION_BYTE_BASE:
+            print(f"Error: overlap with previous section [0x{start:x}, 0x{end:x})")
+            return -1
+    i = i + DownloadHeader.HEADER_SIZE + header.bin_size
+    all_headers.append(header)
+    print("")
+
+def main():
+  args = parser.parse_args(sys.argv[1:])
+  if args.logic_encrypt:
+      args.logic_compress = True
+  build_flash(args.flash_size)
+  return write_output(args)
+
+if __name__ == "__main__":
+  sys.exit(main())

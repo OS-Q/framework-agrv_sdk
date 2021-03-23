@@ -1,0 +1,6 @@
+<DataBase>
+  <Device>
+   <ChipInfo Vendor="AGM" Name="AltaRiscv" Core="JLINK_CORE_RISC_V" WorkRAMAddr="0x20008000" WorkRAMSize="0x8000" />
+   <FlashBankInfo Name="QSPI Flash" BaseAddr="0x80000000" MaxSize="0x01000000" Loader="Devices/AGM/flash_loader.riscv" LoaderType="FLASH_ALGO_TYPE_OPEN" AlwaysPresent="1" Crc="1" />
+  </Device>
+</DataBase>

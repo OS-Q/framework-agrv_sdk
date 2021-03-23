@@ -1,0 +1,12 @@
+{
+  "name": "framework-agrv_sdk",
+  "version": "1.0.0",
+  "description": "Software tools for developing on the AgRV Platform",
+  "keywords": [
+    "framework",
+    "sdk",
+    "risc-v",
+    "agrv",
+    "agm"
+  ]
+}

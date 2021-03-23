@@ -1,0 +1,383 @@
+#!/bin/zsh
+JLINK_EXE=JLinkExe
+INTERFACE=SWD
+SPEED=auto
+DEVICE=AltaRiscv
+
+DRY_RUN=0
+RESET=1
+
+CLK_SOURCE=0
+OPTION_BYTES=0
+PROTECT=0
+READ_PROT=0
+
+FASTPG=1
+ADDRESS=0x80000000
+LOCK=1
+BIN_FILE=
+READ=0
+WRITE=0
+ERASE=0
+ERASE_CHIP=0
+VERIFY=0
+SIZE=0x1000
+
+GUI=0
+CMD=""
+EXIT=1
+QUIET=0
+
+function help()
+{
+  echo "Script to run JLink Commander:"
+  echo "  -n: Dry run"
+  echo "  -s: Speed. Default is auto"
+  echo "  -j: Use JTAG interface. Default is SWD"
+  echo "  -d: Device. Default is AltaRiscv"
+  echo "  -t: halt instead of reset at the beginning and do not reset before exit"
+  echo "  -c: Clock source. 0: HSI (default), 1: HSE, 2: PLL"
+  echo "  -o: Erase option bytes and disable read protection by default"
+  echo "  -p: Don't disable read protection after erasing option bytes"
+  echo "  -P: Enable read protection"
+  echo "  -r: Read binary file from flash with specified size. E.g. -r flash.bin,0x1000"
+  echo "  -w: Write binary file to flash. Verify is done by default"
+  echo "  -e: Erase flash for a given size"
+  echo "  -E: Erase full chip"
+  echo "  -v: Verify binary file"
+  echo "  -a: Start address of read, write, or erase. Default is 0x80000000"
+  echo "  -f: Fast program off"
+  echo "  -g: Display GUI during programming"
+  echo "  -q: Quiet mode"
+  echo "  -x: Do not exit JLink commander"
+  echo "  -X: Additional commands to be executed"
+  exit -1
+}
+
+while getopts "ns:jd:toc:pPr:w:Ee:v:a:z:fgqxX:h" OPTION; do
+  case $OPTION in
+    n)
+      DRY_RUN=1
+      ;;
+    s)
+      SPEED=$OPTARG
+      ;;
+    j)
+      INTERFACE="JTAG -JTAGConf -1,-1"
+      ;;
+    d)
+      DEVICE=$OPTARG
+      ;;
+    t)
+      RESET=0
+      ;;
+    o)
+      OPTION_BYTES=1
+      ;;
+    p)
+      PROTECT=1
+      ;;
+    P)
+      READ_PROT=1
+      ;;
+    c)
+      CLK_SOURCE=$OPTARG
+      ;;
+    r)
+      BIN_FILE=${OPTARG%,*}
+      SIZE=$(printf 0x%x ${OPTARG#*,})
+      READ=1
+      ;;
+    w)
+      BIN_FILE=$OPTARG
+      SIZE=$(stat -c %s $BIN_FILE)
+      WRITE=1
+      ;;
+    e)
+      ERASE=1
+      SIZE=$(printf 0x%x $OPTARG)
+      ;;
+    E)
+      ERASE_CHIP=1
+      ;;
+    v)
+      VERIFY=1
+      BIN_FILE=$OPTARG
+      SIZE=$(stat -c %s $BIN_FILE)
+      ;;
+    a)
+      ADDRESS=$OPTARG
+      ;;
+    f)
+      FASTPG=0
+      ;;
+    g)
+      GUI=1
+      ;;
+    q)
+      QUIET=1
+      ;;
+    x)
+      EXIT=0
+      ;;
+    X)
+      CMD=$OPTARG
+      ;;
+    *)
+      help
+      ;;
+  esac
+done
+
+OPEN_FLASH_LOADER=0
+if [[ $DEVICE == "AltaRiscv" ]]; then
+  OPEN_FLASH_LOADER=1
+fi
+
+if [[ $OPTION_BYTES == 0 && $READ_PROT == 0 && $ERASE_CHIP == 0 && $ERASE == 0 && $WRITE == 0 && $READ == 0 && $VERIFY == 0 && $EXIT == 1 && $CMD == "" ]]; then
+  help
+fi
+
+function clock_config()
+{
+  if (( $CLK_SOURCE < 0 )); then
+    return;
+  fi
+  PLL_ENABLE=$((1 << 5))
+  HSE_BYPASS=$((0 << 3))
+  HSE_ENABLE=$((1 << 2))
+  SCRIPT+="\n// Clock config:\n"
+  SCRIPT+="w4 0x0300000c, 0x00\n" # Switch to OSC. This will not turn off PLL or HSE if they are enabled
+  if (( $CLK_SOURCE == 0 )); then
+    SCRIPT+="w4 0x03000018, 0xf\n" # Use fastest OSC
+  elif (( $CLK_SOURCE == 1 )); then
+    SCRIPT+="w4 0x0300000c, 0x$(printf "%02x" $(($HSE_BYPASS + $HSE_ENABLE + CLK_SOURCE)))\n"
+  elif (( $CLK_SOURCE >= 2 )); then
+    SCRIPT+="w4 0x0300000c, 0x00\n"  # Turn off PLL and HSE if they are enabled
+    SCRIPT+="w4 0x03000060, 0x1\n"   # Turn on FCB clock
+    SCRIPT+="w4 0x40010004, 0x401\n" # PLL chain address
+    SCRIPT+="w4 0x40010000, 0x2A\n"  # FCB_CTRL_WRITE | FCB_CTRL_UPDATE | FCB_CTRL_DEACTIVATE;
+    SCRIPT+="w4 0x40010008, 0x00004009\n"
+    SCRIPT+="w4 0x40010008, 0x00000020\n"
+    SCRIPT+="w4 0x40010008, 0x00000000\n"
+    SCRIPT+="w4 0x40010008, 0x00000000\n"
+    SCRIPT+="w4 0x40010008, 0xFBF7EF1F\n"
+    SCRIPT+="w4 0x40010008, 0x52C080FD\n" # 75MHz under 8M HSE
+    SCRIPT+="w4 0x40010008, 0xF9EF1F49\n"
+    SCRIPT+="w4 0x40010008, 0x0000A402\n"
+    SCRIPT+="w4 0x40010000, 0x10\n"  # Activate FCB
+    SCRIPT+="w4 0x0300000c, 0x$(printf "%02x" $((PLL_ENABLE + $HSE_BYPASS + $HSE_ENABLE + CLK_SOURCE)))\n"
+  fi
+}
+
+function unlock_flash()
+{
+  if [[ $LOCK == 1 ]]; then
+    SCRIPT+="\n// Unlock flash:\n"
+    SCRIPT+="w4 0x40001004, 0x45670123\n" # Unlock
+    SCRIPT+="w4 0x40001004, 0xCDEF89AB\n"
+    SCRIPT+="w4 0x40001008, 0x45670123\n" # Optre
+    SCRIPT+="w4 0x40001008, 0xCDEF89AB\n"
+    # Enable program for both option bytes and regular flash
+    if [[ $FASTPG == 1 ]]; then
+      SCRIPT+="w4 0x40001010, 0x8211 // CR_FASTPG = 1, CR_OPTWRE = 1, CR_OPTPG = 1, CR_PG = 1\n"
+    else
+      SCRIPT+="w4 0x40001010, 0x211 // CR_OPTWRE = 1, CR_OPTPG = 1, CR_PG = 1\n"
+    fi
+  fi
+  LOCK=0
+}
+
+function lock_flash()
+{
+  SCRIPT+="w4 0x40001010, 0x80 // Clear CR and lock flash\n"
+  LOCK=1
+}
+
+function reset_halt()
+{
+  SCRIPT+="\n// Reset halt:\n"
+  SCRIPT+="w4 0x0300001c, 0xf\n" # Disable clocks in debug
+  SCRIPT+="w4 0x03000080, 0x2\n" # Disable watchdog clock
+  if [[ $RESET == 1 ]]; then
+    SCRIPT+="r\n"
+  else
+    SCRIPT+="halt\n"
+  fi
+  LOCK=1
+  clock_config
+}
+
+function program_option_bytes()
+{
+  unlock_flash
+  SCRIPT+="\n// Erase option bytes:\n"
+  SCRIPT+="w4 0x40001010, 0x260 // CR_OPTWRE = 1, CR_START = 1, CR_OPTER = 1\n"
+  SCRIPT+="mem 0x81000000, 1 // Use a memory read to ensure that the erase is complete\n"
+
+  if [[ $PROTECT == 0 ]]; then
+    SCRIPT+="\n// Read unprotect:\n"
+    SCRIPT+="w4 0x40001010, 0x210 // CR_OPTWRE = 1, CR_OPTPG = 1\n"
+    SCRIPT+="w2 0x81000000, 0x5aa5 // Unprotect key\n"
+    SCRIPT+="mem 0x81000000, 1 // Use a memory read to ensure that the auto erase is complete\n"
+  fi
+
+  SCRIPT+="\n// Write option bytes:\n"
+  SCRIPT+="w4 0x40001010, 0x210 // CR_OPTWRE = 1, CR_OPTPG = 1\n"
+
+  FPGA_CONFIG=0x80027000
+  SCRIPT+="w4 0x81000030, $FPGA_CONFIG\n"
+  SCRIPT+="w4 0x81000034, 0x$(printf %x $((0xffffffff-$FPGA_CONFIG)))\n"
+
+  reset_halt # To let the new values take effect
+  read_option_bytes
+}
+
+function read_option_bytes()
+{
+  SCRIPT+="\n// Read option bytes:\n"
+  SCRIPT+="mem 0x81000000, 40\n"
+}
+
+function read_protect()
+{
+  unlock_flash
+  SCRIPT+="\n// Read protect:\n"
+  SCRIPT+="w4 0x40001010, 0x210 // CR_OPTWRE = 1, CR_OPTPG = 1\n"
+  SCRIPT+="w2 0x81000000, 0x0000 // Protect key\n"
+  read_option_bytes
+  lock_flash
+}
+
+function read_binary
+{
+  SCRIPT+="\n// Read to file $BIN_FILE from address: $ADDRESS, size: $SIZE\n"
+  if [[ $BIN_FILE == "-" ]]; then
+    SCRIPT+="mem $ADDRESS, $SIZE\n"
+  else
+    SCRIPT+="savebin $BIN_FILE, $ADDRESS, $SIZE\n"
+  fi
+}
+
+function verify_binary
+{
+  SCRIPT+="\n// Verify file $BIN_FILE at address: $ADDRESS, size: $SIZE\n"
+  SCRIPT+="verifybin $BIN_FILE, $ADDRESS"
+}
+
+function erase_chip
+{
+  SCRIPT+="\n// Erase chip\n"
+  if (( $OPEN_FLASH_LOADER == 1 )); then
+    SCRIPT+="erase\n"
+  else
+    unlock_flash
+    SCRIPT+="w4 0x40001010, 0x44 // CR_START = 1, CR_MER = 1, start a mass erase\n"
+    SCRIPT+="mem $ADDRESS, 1 // Use a memory read to ensure that the erase is complete\n"
+    lock_flash
+  fi
+}
+
+SECTOR_SIZE=0x1000
+BLOCK_SIZE=0x10000
+USE_BLOCK=1
+function erase_flash
+{
+  start_addr=$(($ADDRESS >> 12 << 12))
+  end_addr=$((($ADDRESS + $SIZE - 1 + $SECTOR_SIZE) >> 12 << 12)) # Till next 4K boundary
+  SCRIPT+="\n// Erase flash at address $ADDRESS, size: $SIZE, range [$(printf 0x%x $start_addr), $(printf 0x%x $end_addr))\n"
+  if (( $OPEN_FLASH_LOADER == 1 )); then
+    SCRIPT+="erase $ADDRESS, 0x$(printf %x $(($ADDRESS + $SIZE - 1)))\n"
+    return
+  fi
+  unlock_flash
+  for ((addr = $start_addr; addr < $end_addr; )); do
+    SCRIPT+="w4 0x40001014, 0x$(printf %x $addr) // Address register\n"
+    block_start=$(($addr >> 16 << 16))
+    sector_start=$(($addr >> 12 << 12))
+    if (($USE_BLOCK == 1 && $block_start == $sector_start && $block_start + $BLOCK_SIZE <= $end_addr)); then
+      SCRIPT+="w4 0x40001010, 0x48 // CR_START = 1, CR_BER = 1, start a block erase\n"
+      addr=$(($block_start + $BLOCK_SIZE))
+    else
+      SCRIPT+="w4 0x40001010, 0x42 // CR_START = 1, CR_PER = 1, start a sector erase\n"
+      addr=$(($addr + $SECTOR_SIZE))
+    fi
+    SCRIPT+="mem $ADDRESS, 1 // Use a memory read to ensure that the erase is complete\n"
+  done
+  lock_flash
+}
+
+function write_binary
+{
+  SCRIPT+="\n// Write file $BIN_FILE to address: $ADDRESS, size: $SIZE\n"
+  if (( $OPEN_FLASH_LOADER == 1 )); then
+    SCRIPT+="loadbin $BIN_FILE, $ADDRESS\n"
+    return
+  fi
+  erase_flash # Unlike OPEN_FLASH_LOADER, erase has to be handled manually
+  unlock_flash
+  SCRIPT+="loadbin $BIN_FILE, $ADDRESS\n"
+  SCRIPT+="verifybin $BIN_FILE, $ADDRESS\n"
+  lock_flash
+}
+
+SCRIPT="connect\n"
+if [[ $SPEED == "auto" || $SPEED == "adaptive" ]]; then
+  SCRIPT+="speed 50000\n"
+fi
+reset_halt
+
+if [[ $OPTION_BYTES == 1 ]]; then
+  program_option_bytes
+fi
+
+if [[ $READ_PROT == 1 ]]; then
+  read_protect
+fi
+
+if [[ $ERASE_CHIP == 1 ]]; then
+  erase_chip
+fi
+
+if [[ $ERASE == 1 ]]; then
+  erase_flash
+fi
+
+if [[ $WRITE == 1 ]]; then
+  write_binary
+fi
+
+if [[ $VERIFY == 1 ]]; then
+  verify_binary
+fi
+
+if [[ $READ == 1 ]]; then
+  read_binary
+fi
+
+if [[ -n $CMD ]]; then
+  SCRIPT+="$CMD\n"
+fi
+
+if [[ $EXIT == 1 ]]; then
+  if [[ $RESET == 1 ]]; then
+    SCRIPT+="\nr"
+  fi
+  SCRIPT+="\nexit"
+fi
+
+EXTRA_OPT=
+if [[ $GUI == 0 ]]; then
+# EXTRA_OPT+=-NoGui\ 1
+fi
+
+if [[ $QUIET == 1 ]]; then
+  EXTRA_OPT+=\>\ /dev/null
+fi
+
+export ARGS="$JLINK_EXE -Device $DEVICE -Speed $SPEED -IF $INTERFACE $EXTRA_OPT -CommandFile "
+echo "// $ARGS"
+echo $SCRIPT
+if [[ $DRY_RUN == 0 ]]; then
+  eval $ARGS -CommandFile =(echo $SCRIPT)
+fi
